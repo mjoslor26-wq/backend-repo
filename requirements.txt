@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+google-generativeai
+edge-tts
+moviepy
+requests
+Pillow
+numpy
+opencv-python

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Curiosity Trap – Video Generation Backend
-Uses the NEW google-genai SDK for scripts and TTS.
-Script fallback: 2.5-flash → 2.0-flash → 1.5-flash
-TTS fallback: Gemini native TTS → Edge TTS (always works)
+- Script: Gemini (2.5‑flash → 2.0‑flash → 1.5‑flash) with enforced ~8‑minute length
+- TTS: Gemini native TTS → Edge‑TTS (always works)
+- Video: Ken Burns, vignette, word‑by‑word subtitles
 """
 
 import os, json, io, asyncio, tempfile, logging
@@ -14,14 +14,11 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-# ---------- New Google AI SDK ----------
 from google import genai
 from google.genai import types as genai_types
 
-# ---------- Edge TTS (fallback voice) ----------
 import edge_tts
 
-# ---------- MoviePy ----------
 from moviepy import (
     VideoFileClip, ImageClip, AudioFileClip, CompositeVideoClip,
     TextClip, concatenate_videoclips, vfx
@@ -44,7 +41,7 @@ app.add_middleware(
 
 PEXELS_API_URL = "https://api.pexels.com/v1/search"
 
-# Models to try for scriptwriting (new SDK uses these exact IDs)
+# Models for scriptwriting (tried in order)
 SCRIPT_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -52,7 +49,7 @@ SCRIPT_MODELS = [
 ]
 
 # ----------------------------------------------------------------------
-# 1. SCRIPT GENERATION WITH FALLBACK
+# 1. SCRIPT GENERATION WITH ENFORCED 8‑MINUTE LENGTH
 # ----------------------------------------------------------------------
 def generate_script(theme: str, api_key: str) -> dict:
     client = genai.Client(api_key=api_key)
@@ -62,13 +59,13 @@ def generate_script(theme: str, api_key: str) -> dict:
         try:
             logger.info(f"Trying script model: {model_name}")
             prompt = f"""
-You are a script writer for the documentary series "The Curiosity Trap". Write a script for an ~8 minute video on the theme: "{theme}".
+You are a script writer for the documentary series "The Curiosity Trap". Write a script for an EXACTLY 8‑minute video (about 900‑1000 words) on the theme: "{theme}".
 
 Structure:
 - Title: bold and provocative.
 - Hook: a gap in knowledge, a void effect.
 - 6–8 short chapters, each with a suggestive one-line title.
-- For each chapter, 3–5 sentences of narration (under 12 words per sentence).
+- For each chapter, 5‑7 sentences of narration (under 12 words per sentence).
 - Use dramatic adjectives, personification, contrasts.
 - End with an open reflection or warning.
 - Include a list of key entities (people, places, things).
@@ -87,6 +84,7 @@ Output ONLY a valid JSON object with these exact keys:
   "keyEntities": ["Entity1", "Entity2"],
   "fullText": "the entire narration as a single string, with chapter titles as separators like 'Chapter: TITLE'"
 }}
+The fullText MUST be at least 900 words long.
 Return only valid JSON, no other text.
 """
             response = client.models.generate_content(
@@ -111,6 +109,13 @@ Return only valid JSON, no other text.
                     full += f"Chapter: {ch['title']}. {ch['text']} "
                 script["fullText"] = full.strip()
 
+            # Check word count – enforce 8‑minute length
+            word_count = len(script.get("fullText", "").split())
+            logger.info(f"Script word count: {word_count}")
+            if word_count < 800:
+                logger.warning(f"Script too short ({word_count} words), retrying with different model")
+                continue   # try next model
+
             return script
 
         except Exception as e:
@@ -129,24 +134,20 @@ Return only valid JSON, no other text.
 
 
 # ----------------------------------------------------------------------
-# 2. TTS WITH FALLBACK (Gemini native → Edge TTS)
+# 2. TTS WITH FALLBACK (Gemini → Edge)
 # ----------------------------------------------------------------------
 async def generate_tts_gemini(text: str, api_key: str) -> bytes:
-    """
-    Use Gemini's native audio generation via the new SDK.
-    This requires a model that supports audio output.
-    (Model names are hypothetical – adjust when actual TTS model is available.)
-    """
+    if not api_key:
+        raise RuntimeError("No API key provided for Gemini TTS")
     client = genai.Client(api_key=api_key)
-    # Example: use "gemini-2.0-flash-tts" or a future multimodal model
+    # Placeholder model – adjust when real TTS model is available
     response = client.models.generate_content(
-        model="gemini-2.0-flash-tts",   # placeholder – replace with real TTS model ID
+        model="gemini-2.0-flash-tts",
         contents=text,
         config=genai_types.GenerateContentConfig(
             response_modalities=["AUDIO"],
         ),
     )
-    # Extract audio bytes from the response
     if response.candidates and response.candidates[0].content.parts:
         for part in response.candidates[0].content.parts:
             if hasattr(part, "inline_data") and part.inline_data.mime_type.startswith("audio/"):
@@ -155,7 +156,6 @@ async def generate_tts_gemini(text: str, api_key: str) -> bytes:
 
 
 async def generate_tts_edge(text: str) -> bytes:
-    """Fallback TTS using Edge TTS (always free)."""
     communicate = edge_tts.Communicate(text, "en-US-ChristopherNeural")
     mp3_data = io.BytesIO()
     async for chunk in communicate.stream():
@@ -165,17 +165,19 @@ async def generate_tts_edge(text: str) -> bytes:
 
 
 async def generate_tts_with_fallback(text: str, api_key: str) -> bytes:
-    """Try Gemini TTS first, then fallback to Edge TTS."""
     try:
         logger.info("Attempting Gemini native TTS")
-        return await generate_tts_gemini(text, api_key)
+        if api_key:
+            return await generate_tts_gemini(text, api_key)
+        else:
+            raise RuntimeError("No API key for Gemini TTS")
     except Exception as e:
-        logger.warning(f"Gemini TTS failed ({e}), falling back to Edge TTS")
+        logger.warning(f"Gemini TTS failed ({e}), using Edge TTS fallback")
         return await generate_tts_edge(text)
 
 
 # ----------------------------------------------------------------------
-# 3. HELPER: extract keywords
+# 3. HELPERS: keywords, images, video
 # ----------------------------------------------------------------------
 def extract_keywords(script_data: dict) -> List[str]:
     keywords = set()
@@ -191,9 +193,6 @@ def extract_keywords(script_data: dict) -> List[str]:
     return list(keywords)[:20]
 
 
-# ----------------------------------------------------------------------
-# 4. PEXELS IMAGE FETCH
-# ----------------------------------------------------------------------
 def fetch_images(keywords: List[str], api_key: str, count: int = 15) -> List[str]:
     headers = {"Authorization": api_key}
     urls = []
@@ -208,9 +207,6 @@ def fetch_images(keywords: List[str], api_key: str, count: int = 15) -> List[str
     return urls[:count]
 
 
-# ----------------------------------------------------------------------
-# 5. VIDEO COMPOSITION
-# ----------------------------------------------------------------------
 def download_image(url, max_size=1920):
     resp = requests.get(url, stream=True, timeout=30)
     resp.raw.decode_content = True
@@ -231,12 +227,15 @@ def apply_vignette(frame, intensity=0.6):
 
 
 def build_video(script_data, audio_bytes, image_urls):
+    # Save audio
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
         tmp.write(audio_bytes)
         audio_path = tmp.name
+
     audio_clip = AudioFileClip(audio_path)
     total_dur = audio_clip.duration
 
+    # Download images
     images = []
     for url in image_urls:
         try:
@@ -247,16 +246,15 @@ def build_video(script_data, audio_bytes, image_urls):
     if not images:
         raise ValueError("No valid images downloaded")
 
+    # Create image clips
     avg_dur = total_dur / len(images)
     clips = []
     for img in images:
         clip = ImageClip(img).with_duration(avg_dur)
         # Ken Burns zoom
         clip = clip.resized(lambda t: 1.0 + 0.05 * (t / avg_dur) if avg_dur > 0 else 1.0)
-        # Vignette
-        clip = clip.fl(lambda gf, t: apply_vignette(gf(t)))
-        # Desaturate slightly
-        clip = clip.fx(vfx.colorx, 0.85)
+        # Vignette – using .transform() instead of .fl()
+        clip = clip.transform(lambda frame: apply_vignette(frame))
         clips.append(clip)
 
     video = concatenate_videoclips(clips, method="compose")
@@ -266,18 +264,18 @@ def build_video(script_data, audio_bytes, image_urls):
     video = video.subclip(0, total_dur)
     video = video.with_audio(audio_clip)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as out:
-        video.write_videofile(
-            out.name,
-            fps=24,
-            codec="libx264",
-            audio_codec="aac",
-            threads=2,
-            preset="ultrafast",
-            logger=None,
-            verbose=False,
-        )
-        output_path = out.name
+    # Write to temporary file (no problematic temp_audiofile argument)
+    output_path = tempfile.mktemp(suffix=".mp4")
+    video.write_videofile(
+        output_path,
+        fps=24,
+        codec="libx264",
+        audio_codec="aac",
+        threads=2,
+        preset="ultrafast",
+        logger=None,
+        verbose=False,
+    )
 
     audio_clip.close()
     video.close()

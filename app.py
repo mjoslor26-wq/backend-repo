@@ -1,4 +1,4 @@
-# app.py - Complete AI Video Generation System with UI
+# app.py - Complete AI Video Generation System with UI (using gTTS)
 # Deployable on Render.com
 
 import os
@@ -13,10 +13,10 @@ from typing import Dict, List, Tuple
 from fastapi import FastAPI, Request, Form, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from PIL import Image, ImageDraw, ImageFont
-import edge_tts
+from gtts import gTTS
 import nltk
 import numpy as np
-from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, vfx, afx
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, vfx
 
 # Download NLTK data (will happen on first run)
 try:
@@ -36,10 +36,9 @@ jobs: Dict[str, dict] = {}
 TARGET_DURATION = 480  # 8 minutes
 MAX_SHORT_DURATION = 60
 WORDS_PER_MINUTE = 140
-TARGET_WORDS = int(TARGET_DURATION / 60 * WORDS_PER_MINUTE)
 
 # ----------------------------------------------------------------------
-# HTML Templates (embedded)
+# HTML Templates (embedded - same as before)
 # ----------------------------------------------------------------------
 
 LANDING_PAGE_HTML = """
@@ -296,7 +295,7 @@ RESULT_PAGE_HTML = """
 """
 
 # ----------------------------------------------------------------------
-# Video Generation Engine
+# Video Generation Engine (using gTTS)
 # ----------------------------------------------------------------------
 
 class VideoGenerator:
@@ -328,14 +327,20 @@ class VideoGenerator:
             return f"{self.theme} is an incredible topic. From basics to advanced concepts, this 8-minute guide will take you on a journey of discovery."
 
     async def generate_tts(self, text: str, output_path: Path) -> float:
-        voice = "en-US-JennyNeural"
-        communicate = edge_tts.Communicate(text, voice)
-        await communicate.save(str(output_path))
-        await asyncio.sleep(0.1)  # Ensure file is written
+        """Generate speech using gTTS (Google Text-to-Speech)"""
+        # gTTS is synchronous, so run in thread pool
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._synth_gtts, text, output_path)
+        # Get duration
         audio = AudioFileClip(str(output_path))
         dur = audio.duration
         audio.close()
         return dur
+
+    def _synth_gtts(self, text: str, output_path: Path):
+        """Synchronous gTTS generation"""
+        tts = gTTS(text=text, lang='en', slow=False)
+        tts.save(str(output_path))
 
     async def fetch_image(self, query: str, idx: int) -> Path:
         img_path = self.images_dir / f"img_{idx}.jpg"
@@ -393,7 +398,7 @@ class VideoGenerator:
         try:
             content = await self.fetch_wikipedia_content()
             sentences = re.split(r'(?<=[.!?])\s+', content)
-            # Build segments of ~15-20 sec each
+            # Build segments of ~15-20 sec each (~100 words)
             segments = []
             current = []
             word_count = 0
@@ -426,7 +431,7 @@ class VideoGenerator:
             # Concatenate
             self.update_status("Editing video with transitions...", 85)
             final = concatenate_videoclips(video_clips, method="compose")
-            # Add simple background music (optional but nice)
+            # Add simple background music (optional)
             try:
                 duration = final.duration
                 fps = 44100

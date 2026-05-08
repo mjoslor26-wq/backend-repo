@@ -1,4 +1,4 @@
-# app.py - with persistent job storage (disk-based)
+# app.py - Final working version with persistent storage and stable video generation
 
 import os
 import re
@@ -37,20 +37,16 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="Auto Video Generator")
 
-# ----------------------------------------------------------------------
 # Persistent job storage (JSON files)
-# ----------------------------------------------------------------------
 JOBS_DIR = OUTPUT_DIR / "jobs_meta"
 JOBS_DIR.mkdir(exist_ok=True)
 
 def save_job(job_id: str, job_data: dict):
-    """Save job metadata to disk"""
     job_path = JOBS_DIR / f"{job_id}.json"
     with open(job_path, 'w') as f:
         json.dump(job_data, f, indent=2)
 
 def load_job(job_id: str) -> dict | None:
-    """Load job metadata from disk"""
     job_path = JOBS_DIR / f"{job_id}.json"
     if not job_path.exists():
         return None
@@ -58,18 +54,16 @@ def load_job(job_id: str) -> dict | None:
         return json.load(f)
 
 def update_job(job_id: str, updates: dict):
-    """Update an existing job and persist"""
     job = load_job(job_id)
     if job:
         job.update(updates)
         save_job(job_id, job)
 
-# Helper to get jobs dict in memory for quick access, but fallback to disk
 def get_job(job_id: str) -> dict | None:
     return load_job(job_id)
 
 # ----------------------------------------------------------------------
-# HTML Templates (same as before, only one change: "New Video" links to /)
+# HTML Templates (embedded)
 # ----------------------------------------------------------------------
 
 LANDING_PAGE_HTML = """
@@ -340,7 +334,7 @@ RESULT_PAGE_HTML = """
 """
 
 # ----------------------------------------------------------------------
-# Video Generation Engine (same as before, but uses save_job/update_job)
+# Video Generation Engine (simplified, stable)
 # ----------------------------------------------------------------------
 
 class VideoGenerator:
@@ -419,18 +413,12 @@ class VideoGenerator:
         return img_path
 
     async def create_video_clip(self, image_path: Path, audio_path: Path):
+        """Static image clip with fade in/out. No Ken Burns effect to avoid errors."""
         audio = AudioFileClip(str(audio_path))
         duration = audio.duration
         clip = ImageClip(str(image_path)).resize(height=1080).set_duration(duration)
-        def make_frame(t):
-            zoom = 1 + (t / duration) * 0.08
-            new_w = clip.w / zoom
-            new_h = clip.h / zoom
-            x_center = (clip.w - new_w) * (t / duration) * 0.2
-            y_center = (clip.h - new_h) * (t / duration) * 0.1
-            return clip.crop(x1=x_center, y1=y_center, width=new_w, height=new_h).resize((1920,1080)).get_frame(t)
-        final_clip = clip.fl(make_frame).set_audio(audio)
-        return final_clip.fx(vfx.fadein, 0.5).fx(vfx.fadeout, 0.5)
+        clip = clip.set_audio(audio)
+        return clip.fx(vfx.fadein, 0.5).fx(vfx.fadeout, 0.5)
 
     async def generate(self):
         try:
@@ -466,6 +454,7 @@ class VideoGenerator:
                 video_clips.append(clip)
             self.update_status("Editing video with transitions...", 85)
             final = concatenate_videoclips(video_clips, method="compose")
+            # Add simple background music
             try:
                 duration = final.duration
                 fps = 44100
@@ -559,7 +548,7 @@ Discover everything about {self.theme} in this engaging 8-minute video.
         return title, desc
 
 # ----------------------------------------------------------------------
-# FastAPI Routes (modified to use disk-based storage)
+# FastAPI Routes
 # ----------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
@@ -590,7 +579,6 @@ async def status(job_id: str):
 
 @app.get("/result/{job_id}", response_class=HTMLResponse)
 async def result_page(job_id: str):
-    # We'll just serve the HTML; the frontend will handle missing jobs
     html = RESULT_PAGE_HTML.replace("{{ job_id }}", job_id)
     return HTMLResponse(content=html)
 
@@ -620,7 +608,7 @@ if __name__ == "__main__":
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║   🎬 AI Video Generator - Fully Self-Contained          ║
-    ║   Persistent jobs (disk) + better error handling       ║
+    ║   Persistent jobs + stable clip generation             ║
     ║   ▶  Running on http://localhost:8000                   ║
     ╚══════════════════════════════════════════════════════════╝
     """)

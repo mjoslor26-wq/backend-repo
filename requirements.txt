@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-google-generativeai
+google-genai
 edge-tts
 moviepy
 requests

@@ -1,202 +1,292 @@
-import os
-import io
-import json
-import tempfile
-import asyncio
-import logging
-from typing import List, Optional
+#!/usr/bin/env python3
+"""
+Curiosity Trap – Video Generation Backend
+Uses the NEW google-genai SDK for scripts and TTS.
+Script fallback: 2.5-flash → 2.0-flash → 1.5-flash
+TTS fallback: Gemini native TTS → Edge TTS (always works)
+"""
+
+import os, json, io, asyncio, tempfile, logging
+from typing import List
 
 import requests
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
-import google.generativeai as genai
+from fastapi.responses import StreamingResponse
 
-# MoviePy imports (v2+ style)
-from moviepy import (
-    VideoFileClip,
-    ImageClip,
-    AudioFileClip,
-    CompositeVideoClip,
-    TextClip,
-    concatenate_videoclips,
-    vfx,
-)
+# ---------- New Google AI SDK ----------
+from google import genai
+from google.genai import types as genai_types
 
-# For TTS (free & realistic)
+# ---------- Edge TTS (fallback voice) ----------
 import edge_tts
 
-# ----------------------------------------------------------------------
-# Logging & config
+# ---------- MoviePy ----------
+from moviepy import (
+    VideoFileClip, ImageClip, AudioFileClip, CompositeVideoClip,
+    TextClip, concatenate_videoclips, vfx
+)
+import numpy as np
+from PIL import Image
+
 # ----------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("curiosity-trap-backend")
+logger = logging.getLogger("curiosity-backend")
 
 app = FastAPI(title="Curiosity Trap Backend")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # Tighten this in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------------------------------------------------------------
-# Helper: call Gemini to create a documentary script
-# ----------------------------------------------------------------------
-async def generate_script(theme: str, api_key: str) -> dict:
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    prompt = f"""
-    Create a 8‑minute documentary script about "{theme}". 
-    The output must be a **JSON object** with these keys:
-    - title (string)
-    - chapters (list of objects, each with "title" and "text" (the narration))
-    - fullText (string)  -- the complete narration merged from all chapters
-    - keyEntities (list of strings) -- main names/places/terms
-    """
-    response = model.generate_content(prompt)
-    # Gemini may wrap in ```json, so strip markers
-    text = response.text.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    if text.endswith("```"):
-        text = text[:-3]
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        raise HTTPException(500, "Failed to parse Gemini script output")
-    return data
+PEXELS_API_URL = "https://api.pexels.com/v1/search"
+
+# Models to try for scriptwriting (new SDK uses these exact IDs)
+SCRIPT_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
 
 # ----------------------------------------------------------------------
-# Helper: extract keywords from script (already done on frontend,
-# but we need it here too for image search)
+# 1. SCRIPT GENERATION WITH FALLBACK
 # ----------------------------------------------------------------------
-def extract_keywords(script_data: dict, top_n: int = 20) -> List[str]:
+def generate_script(theme: str, api_key: str) -> dict:
+    client = genai.Client(api_key=api_key)
+
+    last_error = None
+    for model_name in SCRIPT_MODELS:
+        try:
+            logger.info(f"Trying script model: {model_name}")
+            prompt = f"""
+You are a script writer for the documentary series "The Curiosity Trap". Write a script for an ~8 minute video on the theme: "{theme}".
+
+Structure:
+- Title: bold and provocative.
+- Hook: a gap in knowledge, a void effect.
+- 6–8 short chapters, each with a suggestive one-line title.
+- For each chapter, 3–5 sentences of narration (under 12 words per sentence).
+- Use dramatic adjectives, personification, contrasts.
+- End with an open reflection or warning.
+- Include a list of key entities (people, places, things).
+
+Output ONLY a valid JSON object with these exact keys:
+{{
+  "title": "string",
+  "hook": "string",
+  "chapters": [
+    {{
+      "title": "string",
+      "text": "string (narration for that chapter)",
+      "keyword": "single most important visual keyword"
+    }}
+  ],
+  "keyEntities": ["Entity1", "Entity2"],
+  "fullText": "the entire narration as a single string, with chapter titles as separators like 'Chapter: TITLE'"
+}}
+Return only valid JSON, no other text.
+"""
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                ),
+            )
+            raw = response.text.strip()
+            if raw.startswith("```json"):
+                raw = raw[7:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            raw = raw.strip()
+            script = json.loads(raw)
+
+            # Ensure fullText exists
+            if "fullText" not in script:
+                full = ""
+                for ch in script.get("chapters", []):
+                    full += f"Chapter: {ch['title']}. {ch['text']} "
+                script["fullText"] = full.strip()
+
+            return script
+
+        except Exception as e:
+            err_str = str(e)
+            logger.warning(f"Model {model_name} failed: {err_str}")
+            if "429" in err_str or "quota" in err_str.lower():
+                last_error = e
+                continue
+            else:
+                raise HTTPException(500, f"Script generation error: {err_str}")
+
+    raise HTTPException(
+        429,
+        "All Gemini models are currently rate‑limited. Please wait or use a different API key.",
+    )
+
+
+# ----------------------------------------------------------------------
+# 2. TTS WITH FALLBACK (Gemini native → Edge TTS)
+# ----------------------------------------------------------------------
+async def generate_tts_gemini(text: str, api_key: str) -> bytes:
+    """
+    Use Gemini's native audio generation via the new SDK.
+    This requires a model that supports audio output.
+    (Model names are hypothetical – adjust when actual TTS model is available.)
+    """
+    client = genai.Client(api_key=api_key)
+    # Example: use "gemini-2.0-flash-tts" or a future multimodal model
+    response = client.models.generate_content(
+        model="gemini-2.0-flash-tts",   # placeholder – replace with real TTS model ID
+        contents=text,
+        config=genai_types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+        ),
+    )
+    # Extract audio bytes from the response
+    if response.candidates and response.candidates[0].content.parts:
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "inline_data") and part.inline_data.mime_type.startswith("audio/"):
+                return part.inline_data.data
+    raise RuntimeError("No audio data in Gemini TTS response")
+
+
+async def generate_tts_edge(text: str) -> bytes:
+    """Fallback TTS using Edge TTS (always free)."""
+    communicate = edge_tts.Communicate(text, "en-US-ChristopherNeural")
+    mp3_data = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            mp3_data.write(chunk["data"])
+    return mp3_data.getvalue()
+
+
+async def generate_tts_with_fallback(text: str, api_key: str) -> bytes:
+    """Try Gemini TTS first, then fallback to Edge TTS."""
+    try:
+        logger.info("Attempting Gemini native TTS")
+        return await generate_tts_gemini(text, api_key)
+    except Exception as e:
+        logger.warning(f"Gemini TTS failed ({e}), falling back to Edge TTS")
+        return await generate_tts_edge(text)
+
+
+# ----------------------------------------------------------------------
+# 3. HELPER: extract keywords
+# ----------------------------------------------------------------------
+def extract_keywords(script_data: dict) -> List[str]:
     keywords = set()
     for ch in script_data.get("chapters", []):
         for w in ch["title"].split():
             if len(w) > 3:
                 keywords.add(w.lower())
-    title_words = script_data.get("title", "").split()
-    for w in title_words:
+    for w in script_data.get("title", "").split():
         if len(w) > 3:
             keywords.add(w.lower())
     for ent in script_data.get("keyEntities", []):
         keywords.add(ent.lower())
-    return list(keywords)[:top_n]
+    return list(keywords)[:20]
+
 
 # ----------------------------------------------------------------------
-# Helper: fetch images from Pexels
+# 4. PEXELS IMAGE FETCH
 # ----------------------------------------------------------------------
-async def fetch_pexels_images(keywords: List[str], api_key: str, count: int = 15) -> List[str]:
+def fetch_images(keywords: List[str], api_key: str, count: int = 15) -> List[str]:
     headers = {"Authorization": api_key}
     urls = []
-    for kw in keywords:
+    for kw in keywords[:5]:
         if len(urls) >= count:
             break
-        resp = requests.get(
-            "https://api.pexels.com/v1/search",
-            headers=headers,
-            params={"query": kw, "per_page": min(3, count - len(urls))},
-        )
+        params = {"query": kw, "per_page": min(3, count - len(urls)), "orientation": "landscape"}
+        resp = requests.get(PEXELS_API_URL, headers=headers, params=params)
         if resp.status_code == 200:
-            data = resp.json()
-            for photo in data.get("photos", []):
+            for photo in resp.json().get("photos", []):
                 urls.append(photo["src"]["large"])
     return urls[:count]
 
-# ----------------------------------------------------------------------
-# Helper: generate word‑level subtitles (approximate)
-# ----------------------------------------------------------------------
-def generate_word_subtitles(full_text: str, duration: float) -> List[dict]:
-    words = full_text.split()
-    if not words:
-        return []
-    word_duration = duration / len(words)
-    subs = []
-    for i, word in enumerate(words):
-        start = i * word_duration
-        end = start + word_duration
-        subs.append({"start": start, "end": end, "text": word})
-    return subs
 
 # ----------------------------------------------------------------------
-# Helper: create video with Ken Burns effect + audio + subtitles
+# 5. VIDEO COMPOSITION
 # ----------------------------------------------------------------------
-async def build_video(script_data: dict, audio_path: str, image_urls: List[str], output_path: str):
-    # Load audio to get duration
+def download_image(url, max_size=1920):
+    resp = requests.get(url, stream=True, timeout=30)
+    resp.raw.decode_content = True
+    img = Image.open(resp.raw).convert("RGB")
+    if max(img.size) > max_size:
+        ratio = max_size / max(img.size)
+        img = img.resize((int(img.size[0]*ratio), int(img.size[1]*ratio)), Image.LANCZOS)
+    return np.array(img)
+
+
+def apply_vignette(frame, intensity=0.6):
+    h, w = frame.shape[:2]
+    X, Y = np.meshgrid(np.linspace(-1,1,w), np.linspace(-1,1,h))
+    mask = 1 - np.sqrt(X**2 + Y**2) * 0.9
+    mask = np.clip(mask, 0, 1) ** 1.5
+    mask = 1 - intensity + intensity * mask
+    return (frame * mask[..., np.newaxis]).astype(np.uint8)
+
+
+def build_video(script_data, audio_bytes, image_urls):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+        tmp.write(audio_bytes)
+        audio_path = tmp.name
     audio_clip = AudioFileClip(audio_path)
-    total_duration = audio_clip.duration
+    total_dur = audio_clip.duration
 
-    # Prepare word subtitles
-    word_subs = generate_word_subtitles(script_data.get("fullText", ""), total_duration)
-
-    # Create image clips with Ken Burns (zoom effect)
-    image_clips = []
-    clip_duration = total_duration / len(image_urls) if image_urls else total_duration
-
+    images = []
     for url in image_urls:
-        # Download image to temp file
-        r = requests.get(url, stream=True)
-        if r.status_code != 200:
-            continue
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-            f.write(r.content)
-            img_path = f.name
+        try:
+            images.append(download_image(url))
+        except Exception as e:
+            logger.warning(f"Image download failed: {e}")
 
-        clip = ImageClip(img_path).with_duration(clip_duration)
-        # Apply Ken Burns: slow zoom in or out
-        zoom = vfx.Resize(lambda t: 1 + 0.1 * (t / clip_duration))
-        clip = clip.with_effects([zoom])
-        # Crossfade could be added here, but simplify
-        image_clips.append(clip)
+    if not images:
+        raise ValueError("No valid images downloaded")
 
-    if not image_clips:
-        raise HTTPException(500, "No valid images found")
+    avg_dur = total_dur / len(images)
+    clips = []
+    for img in images:
+        clip = ImageClip(img).with_duration(avg_dur)
+        # Ken Burns zoom
+        clip = clip.resized(lambda t: 1.0 + 0.05 * (t / avg_dur) if avg_dur > 0 else 1.0)
+        # Vignette
+        clip = clip.fl(lambda gf, t: apply_vignette(gf(t)))
+        # Desaturate slightly
+        clip = clip.fx(vfx.colorx, 0.85)
+        clips.append(clip)
 
-    # Concatenate image clips (the import we fixed!)
-    video = concatenate_videoclips(image_clips, method="compose")
+    video = concatenate_videoclips(clips, method="compose")
+    if video.duration < total_dur:
+        loops = int(np.ceil(total_dur / video.duration))
+        video = concatenate_videoclips([video] * loops, method="compose")
+    video = video.subclip(0, total_dur)
     video = video.with_audio(audio_clip)
 
-    # Burn word subtitles
-    subtitle_clips = []
-    for sub in word_subs:
-        txt = TextClip(
-            text=sub["text"],
-            font_size=48,
-            color="white",
-            stroke_color="black",
-            stroke_width=2,
-            font="Arial",
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as out:
+        video.write_videofile(
+            out.name,
+            fps=24,
+            codec="libx264",
+            audio_codec="aac",
+            threads=2,
+            preset="ultrafast",
+            logger=None,
+            verbose=False,
         )
-        txt = txt.with_position(("center", "center")).with_start(sub["start"]).with_duration(
-            sub["end"] - sub["start"]
-        )
-        subtitle_clips.append(txt)
+        output_path = out.name
 
-    final = CompositeVideoClip([video] + subtitle_clips)
+    audio_clip.close()
+    video.close()
+    os.unlink(audio_path)
+    return output_path
 
-    final.write_videofile(
-        output_path,
-        fps=24,
-        codec="libx264",
-        audio_codec="aac",
-        temp_audiofile="temp-audio.m4a",
-        remove_temp=True,
-    )
-
-    # Cleanup image temp files
-    for clip in image_clips:
-        if hasattr(clip, "filename"):
-            try:
-                os.unlink(clip.filename)
-            except:
-                pass
 
 # ----------------------------------------------------------------------
-# Endpoints
+# ENDPOINTS
 # ----------------------------------------------------------------------
 @app.post("/api/generate-script")
 async def api_generate_script(data: dict):
@@ -204,79 +294,52 @@ async def api_generate_script(data: dict):
     api_key = data.get("apiKey")
     if not theme or not api_key:
         raise HTTPException(400, "theme and apiKey are required")
-    try:
-        script = await generate_script(theme, api_key)
-        return script
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    script = generate_script(theme, api_key)
+    return script
+
 
 @app.post("/api/generate-tts")
 async def api_generate_tts(data: dict):
     text = data.get("text")
-    voice = data.get("voice", "en-US-ChristopherNeural")
+    api_key = data.get("apiKey", "")
     if not text:
         raise HTTPException(400, "text is required")
+    audio_bytes = await generate_tts_with_fallback(text, api_key)
+    return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
 
-    # Use Edge TTS to generate audio in memory
-    communicate = edge_tts.Communicate(text, voice)
-    mp3_data = io.BytesIO()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            mp3_data.write(chunk["data"])
-    mp3_data.seek(0)
-
-    return StreamingResponse(
-        mp3_data,
-        media_type="audio/mpeg",
-        headers={"Content-Disposition": "inline; filename=tts.mp3"},
-    )
 
 @app.post("/api/fetch-images")
 async def api_fetch_images(data: dict):
-    keywords = data.get("keywords")
+    keywords = data.get("keywords", [])
     api_key = data.get("apiKey")
     count = data.get("count", 15)
     if not keywords or not api_key:
-        raise HTTPException(400, "keywords and apiKey are required")
-    try:
-        urls = await fetch_pexels_images(keywords, api_key, count)
-        return {"urls": urls}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(400, "keywords and apiKey required")
+    urls = fetch_images(keywords, api_key, count)
+    return {"urls": urls}
+
 
 @app.post("/api/compose-video")
 async def api_compose_video(
     script: str = Form(...),
     audio: UploadFile = File(...),
     imageUrls: str = Form(...),
-    duration: Optional[str] = Form("480"),
 ):
     script_data = json.loads(script)
     image_urls = json.loads(imageUrls)
-
-    # Save audio to a temporary file
     audio_bytes = await audio.read()
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-        f.write(audio_bytes)
-        audio_path = f.name
 
-    # Output video file
-    output_path = tempfile.mktemp(suffix=".mp4")
+    loop = asyncio.get_running_loop()
+    video_path = await loop.run_in_executor(None, build_video, script_data, audio_bytes, image_urls)
 
-    try:
-        await build_video(script_data, audio_path, image_urls, output_path)
-    except Exception as e:
-        raise HTTPException(500, str(e))
-    finally:
-        if os.path.exists(audio_path):
-            os.unlink(audio_path)
+    def iterfile():
+        with open(video_path, "rb") as f:
+            while chunk := f.read(1024 * 1024):
+                yield chunk
+        os.unlink(video_path)
 
-    return FileResponse(
-        output_path,
-        media_type="video/mp4",
-        filename="documentary.mp4",
-        background=None,  # Removes the file after response sent (FastAPI 0.111+)
-    )
+    return StreamingResponse(iterfile(), media_type="video/mp4")
+
 
 @app.post("/api/add-subtitles")
 async def api_add_subtitles(
@@ -284,57 +347,62 @@ async def api_add_subtitles(
     script: str = Form(...),
 ):
     script_data = json.loads(script)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(await video.read())
+        input_path = tmp.name
 
-    # Save uploaded video to a temp file
-    video_bytes = await video.read()
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-        f.write(video_bytes)
-        input_path = f.name
-
-    # Load video + audio
     clip = VideoFileClip(input_path)
-    audio = clip.audio
-    duration = clip.duration
+    total_dur = clip.duration
+    words = script_data.get("fullText", "").split()
+    if not words:
+        raise HTTPException(400, "No text for subtitles")
 
-    word_subs = generate_word_subtitles(script_data.get("fullText", ""), duration)
-
-    subtitles = []
-    for sub in word_subs:
+    word_dur = total_dur / len(words)
+    txt_clips = []
+    for i, word in enumerate(words):
         txt = TextClip(
-            text=sub["text"],
+            text=word,
             font_size=48,
             color="white",
             stroke_color="black",
             stroke_width=2,
             font="Arial",
         )
-        txt = txt.with_position(("center", "center")).with_start(sub["start"]).with_duration(
-            sub["end"] - sub["start"]
+        txt = txt.with_position(("center", "center")).with_start(i * word_dur).with_duration(word_dur)
+        txt_clips.append(txt)
+
+    final = CompositeVideoClip([clip] + txt_clips)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as out:
+        final.write_videofile(
+            out.name,
+            fps=24,
+            codec="libx264",
+            audio_codec="aac",
+            preset="ultrafast",
+            verbose=False,
+            logger=None,
         )
-        subtitles.append(txt)
+        output_path = out.name
 
-    final = CompositeVideoClip([clip] + subtitles)
-    output_path = tempfile.mktemp(suffix=".mp4")
-    final.write_videofile(
-        output_path,
-        codec="libx264",
-        audio_codec="aac",
-        temp_audiofile="temp-audio.m4a",
-        remove_temp=True,
-    )
-
-    # Cleanup
+    clip.close()
+    final.close()
     os.unlink(input_path)
 
-    return FileResponse(
-        output_path,
-        media_type="video/mp4",
-        filename="documentary_subtitled.mp4",
-    )
+    def iterfile():
+        with open(output_path, "rb") as f:
+            while chunk := f.read(1024 * 1024):
+                yield chunk
+        os.unlink(output_path)
 
-# ----------------------------------------------------------------------
-# Run with: uvicorn app:app --host 0.0.0.0 --port 10000
-# ----------------------------------------------------------------------
+    return StreamingResponse(iterfile(), media_type="video/mp4")
+
+
+@app.get("/")
+async def root():
+    return {"status": "Curiosity Trap Backend running"}
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

@@ -1,4 +1,4 @@
-# app.py - Final working version with persistent storage and stable video generation
+# app.py - Memory-optimized version for Render free tier
 
 import os
 import re
@@ -6,6 +6,7 @@ import asyncio
 import aiohttp
 import uuid
 import json
+import gc
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -63,7 +64,7 @@ def get_job(job_id: str) -> dict | None:
     return load_job(job_id)
 
 # ----------------------------------------------------------------------
-# HTML Templates (embedded)
+# HTML Templates (embedded) - same as before, unchanged
 # ----------------------------------------------------------------------
 
 LANDING_PAGE_HTML = """
@@ -334,7 +335,7 @@ RESULT_PAGE_HTML = """
 """
 
 # ----------------------------------------------------------------------
-# Video Generation Engine (simplified, stable)
+# Video Generation Engine (Memory-optimized)
 # ----------------------------------------------------------------------
 
 class VideoGenerator:
@@ -359,10 +360,10 @@ class VideoGenerator:
             if not search:
                 return f"Explore the fascinating world of {self.theme}. This complete guide covers everything you need to know."
             page = wikipedia.page(search[0])
-            summary = page.summary[:1500]
+            summary = page.summary[:1200]  # Shorter for less TTS generation time
             return f"{summary} In this video we'll dive deep into {self.theme} and uncover amazing facts and insights."
         except:
-            return f"{self.theme} is an incredible topic. From basics to advanced concepts, this 8-minute guide will take you on a journey of discovery."
+            return f"{self.theme} is an incredible topic. From basics to advanced concepts, this guide will take you on a journey of discovery."
 
     async def generate_tts(self, text: str, output_path: Path) -> float:
         loop = asyncio.get_event_loop()
@@ -395,30 +396,32 @@ class VideoGenerator:
                                     return img_path
             except:
                 pass
-        # Generate artistic placeholder
-        img = Image.new('RGB', (1920, 1080), color=(25, 25, 45))
+        # Generate artistic placeholder (lower resolution than before)
+        img = Image.new('RGB', (1280, 720), color=(25, 25, 45))  # 720p base
         draw = ImageDraw.Draw(img)
-        for i in range(1080):
-            r = 25 + int(i/1080 * 60)
-            g = 25 + int(i/1080 * 40)
-            b = 45 + int(i/1080 * 80)
-            draw.line([(0,i), (1920,i)], fill=(r,g,b))
+        for i in range(720):
+            r = 25 + int(i/720 * 60)
+            g = 25 + int(i/720 * 40)
+            b = 45 + int(i/720 * 80)
+            draw.line([(0,i), (1280,i)], fill=(r,g,b))
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 70)
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 50)
         except:
             font = ImageFont.load_default()
-        draw.text((960,540), self.theme.upper(), fill=(255,215,0), anchor="mm", font=font)
-        draw.text((960,650), query[:60], fill=(200,200,200), anchor="mm", font=font)
+        draw.text((640,360), self.theme.upper(), fill=(255,215,0), anchor="mm", font=font)
+        draw.text((640,440), query[:50], fill=(200,200,200), anchor="mm", font=font)
+        # Resize to 1280x720 (final render resolution)
+        img = img.resize((1280, 720), Image.LANCZOS)
         img.save(img_path)
         return img_path
 
     async def create_video_clip(self, image_path: Path, audio_path: Path):
-        """Static image clip with fade in/out. No Ken Burns effect to avoid errors."""
         audio = AudioFileClip(str(audio_path))
         duration = audio.duration
-        clip = ImageClip(str(image_path)).resize(height=1080).set_duration(duration)
+        clip = ImageClip(str(image_path)).resize(height=720).set_duration(duration)
         clip = clip.set_audio(audio)
-        return clip.fx(vfx.fadein, 0.5).fx(vfx.fadeout, 0.5)
+        # Only fade in/out (lightweight)
+        return clip.fx(vfx.fadein, 0.3).fx(vfx.fadeout, 0.3)
 
     async def generate(self):
         try:
@@ -427,7 +430,7 @@ class VideoGenerator:
             segments = []
             current = []
             word_count = 0
-            for sent in sentences[:80]:
+            for sent in sentences[:60]:  # Limit input
                 words = len(sent.split())
                 if word_count + words > 100:
                     if current:
@@ -439,38 +442,58 @@ class VideoGenerator:
                     word_count += words
             if current:
                 segments.append(' '.join(current))
-            while len(segments) < 20:
+            # Ensure at least some segments
+            while len(segments) < 15:
                 segments.append(f"Let's continue exploring {self.theme}. Amazing insights await.")
+            # Limit to 25 segments max to reduce memory
+            segments = segments[:25]
             video_clips = []
             total_segs = len(segments)
-            for i, seg_text in enumerate(segments[:35]):
+            for i, seg_text in enumerate(segments):
                 prog = 20 + int((i/total_segs)*70)
-                self.update_status(f"Creating scene {i+1}/{min(35,total_segs)}", prog)
+                self.update_status(f"Creating scene {i+1}/{total_segs}", prog)
                 audio_path = self.audio_dir / f"seg_{i}.mp3"
                 await self.generate_tts(seg_text, audio_path)
                 kw = ' '.join([w for w in seg_text.split()[:5] if len(w)>3]) or self.theme
                 img_path = await self.fetch_image(kw, i)
                 clip = await self.create_video_clip(img_path, audio_path)
                 video_clips.append(clip)
+                # Force garbage collection after each clip
+                gc.collect()
             self.update_status("Editing video with transitions...", 85)
             final = concatenate_videoclips(video_clips, method="compose")
-            # Add simple background music
+            # Very light background music (optional, skip if memory tight)
             try:
                 duration = final.duration
-                fps = 44100
+                fps = 22050  # Lower sample rate to save memory
                 t = np.linspace(0, duration, int(fps*duration))
-                music = 0.15 * np.sin(2*np.pi*261.63*t) * np.exp(-t/40)
-                music += 0.1 * np.sin(2*np.pi*329.63*t) * np.exp(-t/40)
+                music = 0.1 * np.sin(2*np.pi*261.63*t) * np.exp(-t/30)
+                music += 0.07 * np.sin(2*np.pi*329.63*t) * np.exp(-t/30)
                 import soundfile as sf
                 music_path = self.job_dir / "bg_music.wav"
                 sf.write(music_path, music, fps)
                 from moviepy.editor import AudioFileClip as AF
-                bg = AF(str(music_path)).volumex(0.2)
+                bg = AF(str(music_path)).volumex(0.15)
                 final = final.set_audio(bg)
             except:
                 pass
             out_video = self.job_dir / "final_8min.mp4"
-            final.write_videofile(str(out_video), fps=24, codec='libx264', audio_codec='aac', threads=2, preset='medium')
+            # Use 720p, lower bitrate, ultrafast preset to reduce memory
+            final.write_videofile(
+                str(out_video),
+                fps=24,
+                codec='libx264',
+                audio_codec='aac',
+                threads=1,          # Use single thread to reduce memory
+                preset='ultrafast',
+                bitrate='1000k'
+            )
+            # Cleanup to free memory
+            final.close()
+            for clip in video_clips:
+                clip.close()
+            video_clips.clear()
+            gc.collect()
             self.update_status("Creating TikTok shorts...", 90)
             await self.create_shorts(out_video)
             thumb_path = await self.generate_thumbnail()
@@ -486,39 +509,43 @@ class VideoGenerator:
             })
             self.update_status("Complete! Ready to download.", 100)
         except Exception as e:
-            update_job(self.job_id, {'status': f"Error: {str(e)}", 'error': str(e)})
+            error_msg = f"Error: {str(e)}"
+            print(error_msg)  # This will appear in Render logs
+            update_job(self.job_id, {'status': error_msg, 'error': str(e)})
 
     async def create_shorts(self, video_path: Path):
         from moviepy.video.io.VideoFileClip import VideoFileClip
         video = VideoFileClip(str(video_path))
         dur = video.duration
         clip1 = video.subclip(0, min(60, dur))
-        clip1.write_videofile(str(self.job_dir / "short1.mp4"), fps=24)
+        clip1.write_videofile(str(self.job_dir / "short1.mp4"), fps=24, preset='ultrafast')
         start = max(0, (dur - 60) // 2) if dur > 120 else max(0, dur-60)
         clip2 = video.subclip(start, min(start+60, dur))
-        clip2.write_videofile(str(self.job_dir / "short2.mp4"), fps=24)
+        clip2.write_videofile(str(self.job_dir / "short2.mp4"), fps=24, preset='ultrafast')
         video.close()
+        clip1.close()
+        clip2.close()
 
     async def generate_thumbnail(self) -> Path:
-        img = Image.new('RGB', (1920,1080), color=(15,25,45))
+        img = Image.new('RGB', (1280,720), color=(15,25,45))
         draw = ImageDraw.Draw(img)
-        for i in range(1080):
-            r = 15 + int(i/1080*60)
-            g = 25 + int(i/1080*40)
-            b = 45 + int(i/1080*80)
-            draw.line([(0,i),(1920,i)], fill=(r,g,b))
+        for i in range(720):
+            r = 15 + int(i/720*60)
+            g = 25 + int(i/720*40)
+            b = 45 + int(i/720*80)
+            draw.line([(0,i),(1280,i)], fill=(r,g,b))
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 110)
-            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 55)
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 70)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 35)
         except:
             font = ImageFont.load_default()
             font_small = font
         text = self.theme.upper()
-        for dx,dy in [(-3,-3),(-3,3),(3,-3),(3,3)]:
-            draw.text((960+dx,400+dy), text, fill=(0,0,0), anchor="mm", font=font)
-        draw.text((960,400), text, fill=(255,215,0), anchor="mm", font=font)
-        draw.text((960,580), "Full Documentary", fill=(255,255,255), anchor="mm", font=font_small)
-        draw.text((960,680), "8 Minutes • HD", fill=(200,200,200), anchor="mm", font=font_small)
+        for dx,dy in [(-2,-2),(-2,2),(2,-2),(2,2)]:
+            draw.text((640+dx,260+dy), text, fill=(0,0,0), anchor="mm", font=font)
+        draw.text((640,260), text, fill=(255,215,0), anchor="mm", font=font)
+        draw.text((640,380), "Full Documentary", fill=(255,255,255), anchor="mm", font=font_small)
+        draw.text((640,450), "8 Minutes • HD", fill=(200,200,200), anchor="mm", font=font_small)
         thumb_path = self.job_dir / "thumbnail.jpg"
         img.save(thumb_path)
         return thumb_path
@@ -607,8 +634,8 @@ if __name__ == "__main__":
     import uvicorn
     print("""
     ╔══════════════════════════════════════════════════════════╗
-    ║   🎬 AI Video Generator - Fully Self-Contained          ║
-    ║   Persistent jobs + stable clip generation             ║
+    ║   🎬 AI Video Generator - Memory Optimized             ║
+    ║   720p | ultrafast preset | lower memory footprint     ║
     ║   ▶  Running on http://localhost:8000                   ║
     ╚══════════════════════════════════════════════════════════╝
     """)

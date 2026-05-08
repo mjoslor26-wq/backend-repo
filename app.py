@@ -1,5 +1,5 @@
 # app.py - Complete AI Video Generation System with UI (using gTTS)
-# Deployable on Render.com
+# Deployable on Render.com - includes PIL compatibility fix
 
 import os
 import re
@@ -13,6 +13,11 @@ from typing import Dict, List, Tuple
 from fastapi import FastAPI, Request, Form, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from PIL import Image, ImageDraw, ImageFont
+
+# >>> FIX for Pillow >= 10.0.0: ANTIALIAS removed, replace with LANCZOS
+if not hasattr(Image, 'ANTIALIAS'):
+    Image.ANTIALIAS = Image.LANCZOS
+
 from gtts import gTTS
 import nltk
 import numpy as np
@@ -328,23 +333,19 @@ class VideoGenerator:
 
     async def generate_tts(self, text: str, output_path: Path) -> float:
         """Generate speech using gTTS (Google Text-to-Speech)"""
-        # gTTS is synchronous, so run in thread pool
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._synth_gtts, text, output_path)
-        # Get duration
         audio = AudioFileClip(str(output_path))
         dur = audio.duration
         audio.close()
         return dur
 
     def _synth_gtts(self, text: str, output_path: Path):
-        """Synchronous gTTS generation"""
         tts = gTTS(text=text, lang='en', slow=False)
         tts.save(str(output_path))
 
     async def fetch_image(self, query: str, idx: int) -> Path:
         img_path = self.images_dir / f"img_{idx}.jpg"
-        # Try Unsplash if key provided
         if UNSPLASH_ACCESS_KEY:
             try:
                 async with aiohttp.ClientSession() as session:

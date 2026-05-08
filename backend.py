@@ -1,35 +1,22 @@
-# app.py - Complete Video Generation System with UI
-# Deploy on Render.com: https://render.com
+# app.py - Complete AI Video Generation System with UI
+# Deployable on Render.com
 
 import os
 import re
 import asyncio
 import aiohttp
-import shutil
 import uuid
-import json
-import hashlib
-import subprocess
-import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Tuple
 
 from fastapi import FastAPI, Request, Form, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-import requests
-from moviepy.editor import (
-    ImageClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips,
-    TextClip, ColorClip, vfx, afx
-)
-from moviepy.video.fx import fadein, fadeout
+from PIL import Image, ImageDraw, ImageFont
 import edge_tts
 import nltk
 import numpy as np
+from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, vfx, afx
 
 # Download NLTK data (will happen on first run)
 try:
@@ -39,22 +26,13 @@ except LookupError:
     nltk.download('stopwords', quiet=True)
 
 # Configuration
-UNSPLASH_ACCESS_KEY = os.getenv('UNSPLASH_ACCESS_KEY', '')  # Optional
-OUTPUT_DIR = Path("/tmp/generated_videos" if os.name != 'nt' else "generated_videos")
+UNSPLASH_ACCESS_KEY = os.getenv('UNSPLASH_ACCESS_KEY', '')
+OUTPUT_DIR = Path("/tmp/generated_videos")
 OUTPUT_DIR.mkdir(exist_ok=True)
-TEMP_DIR = Path("/tmp/temp_media" if os.name != 'nt' else "temp_media")
-TEMP_DIR.mkdir(exist_ok=True)
-
-# Create necessary directories
-Path("static").mkdir(exist_ok=True)
-Path("templates").mkdir(exist_ok=True)
 
 app = FastAPI(title="Auto Video Generator")
-
-# In-memory job storage
 jobs: Dict[str, dict] = {}
 
-# Constants
 TARGET_DURATION = 480  # 8 minutes
 MAX_SHORT_DURATION = 60
 WORDS_PER_MINUTE = 140
@@ -72,13 +50,9 @@ LANDING_PAGE_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Video Generator • Create Viral Videos</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
             background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
             min-height: 100vh;
             display: flex;
@@ -93,8 +67,6 @@ LANDING_PAGE_HTML = """
             max-width: 700px;
             width: 100%;
             box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5);
-            backdrop-filter: blur(10px);
-            transition: transform 0.3s;
         }
         h1 {
             font-size: 3em;
@@ -104,11 +76,7 @@ LANDING_PAGE_HTML = """
             color: transparent;
             margin-bottom: 12px;
         }
-        .subtitle {
-            color: #4b5563;
-            font-size: 1.1em;
-            margin-bottom: 32px;
-        }
+        .subtitle { color: #4b5563; font-size: 1.1em; margin-bottom: 32px; }
         .features {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -120,7 +88,6 @@ LANDING_PAGE_HTML = """
             padding: 12px;
             border-radius: 16px;
             font-weight: 500;
-            color: #1f2937;
             text-align: center;
         }
         input {
@@ -130,12 +97,10 @@ LANDING_PAGE_HTML = """
             border: 2px solid #e5e7eb;
             border-radius: 24px;
             margin-bottom: 24px;
-            transition: all 0.2s;
         }
         input:focus {
             outline: none;
             border-color: #8b5cf6;
-            box-shadow: 0 0 0 3px rgba(139,92,246,0.1);
         }
         button {
             background: linear-gradient(135deg, #667eea, #764ba2);
@@ -147,12 +112,8 @@ LANDING_PAGE_HTML = """
             border-radius: 40px;
             cursor: pointer;
             width: 100%;
-            transition: all 0.2s;
         }
-        button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 25px -5px rgba(102,126,234,0.4);
-        }
+        button:hover { transform: translateY(-2px); }
         .info {
             background: #f9fafb;
             border-radius: 20px;
@@ -161,11 +122,7 @@ LANDING_PAGE_HTML = """
             font-size: 0.9em;
             color: #6b7280;
         }
-        .loader {
-            display: none;
-            margin-top: 24px;
-            text-align: center;
-        }
+        .loader { display: none; margin-top: 24px; text-align: center; }
         .spinner {
             border: 3px solid #e5e7eb;
             border-top: 3px solid #8b5cf6;
@@ -175,14 +132,7 @@ LANDING_PAGE_HTML = """
             animation: spin 1s linear infinite;
             margin: 0 auto;
         }
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        @media (max-width: 640px) {
-            .container { padding: 32px; }
-            h1 { font-size: 2em; }
-        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -238,137 +188,24 @@ RESULT_PAGE_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Your Video is Ready!</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-            background: #0f172a;
-            padding: 24px;
-        }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 32px;
-            padding: 32px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
-        }
-        .header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 32px;
-            flex-wrap: wrap;
-        }
-        .new-btn {
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            color: white;
-            padding: 10px 24px;
-            border-radius: 40px;
-            text-decoration: none;
-            font-weight: 600;
-        }
-        .progress-section {
-            text-align: center;
-            padding: 60px 20px;
-        }
-        .progress-bar {
-            width: 100%;
-            height: 28px;
-            background: #e2e8f0;
-            border-radius: 14px;
-            overflow: hidden;
-            margin: 24px 0;
-        }
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #667eea, #764ba2);
-            width: 0%;
-            transition: width 0.3s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: bold;
-        }
-        .results {
-            display: none;
-        }
-        .video-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 32px;
-            margin: 32px 0;
-        }
-        .card {
-            background: #f8fafc;
-            border-radius: 24px;
-            padding: 24px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-        }
-        .card h3 {
-            margin-bottom: 16px;
-            color: #1e293b;
-        }
-        video, img {
-            width: 100%;
-            border-radius: 16px;
-            margin: 16px 0;
-            background: #000;
-        }
-        button, .download-btn {
-            background: #3b82f6;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 40px;
-            cursor: pointer;
-            font-weight: 500;
-            margin: 4px;
-            display: inline-block;
-            text-decoration: none;
-        }
-        .metadata {
-            background: #f1f5f9;
-            border-radius: 24px;
-            padding: 24px;
-            margin-top: 32px;
-        }
-        .title-box {
-            background: white;
-            padding: 16px;
-            border-radius: 16px;
-            font-weight: bold;
-            margin: 12px 0;
-        }
-        .desc-box {
-            background: white;
-            padding: 16px;
-            border-radius: 16px;
-            font-family: monospace;
-            white-space: pre-wrap;
-            font-size: 0.9em;
-        }
-        .short-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-top: 20px;
-        }
-        @media (max-width: 768px) {
-            .video-grid, .short-row { grid-template-columns: 1fr; }
-            .container { padding: 20px; }
-        }
-        .loading-text {
-            animation: pulse 1.5s infinite;
-        }
-        @keyframes pulse {
-            0%,100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: system-ui, sans-serif; background: #0f172a; padding: 24px; }
+        .container { max-width: 1400px; margin: 0 auto; background: white; border-radius: 32px; padding: 32px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 32px; flex-wrap: wrap; }
+        .new-btn { background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 10px 24px; border-radius: 40px; text-decoration: none; font-weight: 600; }
+        .progress-section { text-align: center; padding: 60px 20px; }
+        .progress-bar { width: 100%; height: 28px; background: #e2e8f0; border-radius: 14px; overflow: hidden; margin: 24px 0; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2); width: 0%; transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; }
+        .results { display: none; }
+        .video-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; margin: 32px 0; }
+        .card { background: #f8fafc; border-radius: 24px; padding: 24px; }
+        video, img { width: 100%; border-radius: 16px; margin: 16px 0; background: #000; }
+        button, .download-btn { background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 40px; cursor: pointer; margin: 4px; display: inline-block; }
+        .metadata { background: #f1f5f9; border-radius: 24px; padding: 24px; margin-top: 32px; }
+        .title-box { background: white; padding: 16px; border-radius: 16px; font-weight: bold; margin: 12px 0; }
+        .desc-box { background: white; padding: 16px; border-radius: 16px; font-family: monospace; white-space: pre-wrap; font-size: 0.9em; }
+        .short-row { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
+        @media (max-width: 768px) { .video-grid, .short-row { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
@@ -381,7 +218,7 @@ RESULT_PAGE_HTML = """
         <h2>🔄 Generating your content...</h2>
         <div class="progress-bar"><div class="progress-fill" id="progressFill">0%</div></div>
         <p id="statusMsg" style="color: #475569;">Starting up...</p>
-        <div class="loading-text">⏳ This takes ~3-5 minutes. Please wait.</div>
+        <div>⏳ This takes ~3-5 minutes. Please wait.</div>
     </div>
     <div id="resultsSection" class="results">
         <h2>🎉 Your video package is ready!</h2>
@@ -447,9 +284,7 @@ RESULT_PAGE_HTML = """
             document.getElementById('descDisplay').innerText = data.description || 'Description will appear here.';
         });
     }
-    function downloadFile(type) {
-        window.location.href = `/download/${jobId}/${type}`;
-    }
+    function downloadFile(type) { window.location.href = `/download/${jobId}/${type}`; }
     function copyMetadata() {
         const title = document.getElementById('titleDisplay').innerText;
         const desc = document.getElementById('descDisplay').innerText;
@@ -496,6 +331,7 @@ class VideoGenerator:
         voice = "en-US-JennyNeural"
         communicate = edge_tts.Communicate(text, voice)
         await communicate.save(str(output_path))
+        await asyncio.sleep(0.1)  # Ensure file is written
         audio = AudioFileClip(str(output_path))
         dur = audio.duration
         audio.close()
@@ -503,7 +339,7 @@ class VideoGenerator:
 
     async def fetch_image(self, query: str, idx: int) -> Path:
         img_path = self.images_dir / f"img_{idx}.jpg"
-        # Try Unsplash if key present
+        # Try Unsplash if key provided
         if UNSPLASH_ACCESS_KEY:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -521,10 +357,9 @@ class VideoGenerator:
                                     return img_path
             except:
                 pass
-        # Generate artistic placeholder image
+        # Generate artistic placeholder
         img = Image.new('RGB', (1920, 1080), color=(25, 25, 45))
         draw = ImageDraw.Draw(img)
-        # Gradient
         for i in range(1080):
             r = 25 + int(i/1080 * 60)
             g = 25 + int(i/1080 * 40)
@@ -543,7 +378,7 @@ class VideoGenerator:
         audio = AudioFileClip(str(audio_path))
         duration = audio.duration
         clip = ImageClip(str(image_path)).resize(height=1080).set_duration(duration)
-        # Ken Burns effect using resize/position over time
+        # Ken Burns effect
         def make_frame(t):
             zoom = 1 + (t / duration) * 0.08
             new_w = clip.w / zoom
@@ -552,11 +387,10 @@ class VideoGenerator:
             y_center = (clip.h - new_h) * (t / duration) * 0.1
             return clip.crop(x1=x_center, y1=y_center, width=new_w, height=new_h).resize((1920,1080)).get_frame(t)
         final_clip = clip.fl(make_frame).set_audio(audio)
-        return final_clip.fx(fadein, 0.5).fx(fadeout, 0.5)
+        return final_clip.fx(vfx.fadein, 0.5).fx(vfx.fadeout, 0.5)
 
     async def generate(self):
         try:
-            # Script generation
             content = await self.fetch_wikipedia_content()
             sentences = re.split(r'(?<=[.!?])\s+', content)
             # Build segments of ~15-20 sec each
@@ -575,7 +409,6 @@ class VideoGenerator:
                     word_count += words
             if current:
                 segments.append(' '.join(current))
-            # Ensure enough segments for 8min
             while len(segments) < 20:
                 segments.append(f"Let's continue exploring {self.theme}. Amazing insights await.")
             # Generate clips
@@ -593,7 +426,7 @@ class VideoGenerator:
             # Concatenate
             self.update_status("Editing video with transitions...", 85)
             final = concatenate_videoclips(video_clips, method="compose")
-            # Add ambient background music (simple sine wave)
+            # Add simple background music (optional but nice)
             try:
                 duration = final.duration
                 fps = 44100
@@ -603,19 +436,18 @@ class VideoGenerator:
                 import soundfile as sf
                 music_path = self.job_dir / "bg_music.wav"
                 sf.write(music_path, music, fps)
-                bg = AudioFileClip(str(music_path)).volumex(0.2)
+                from moviepy.editor import AudioFileClip as AF
+                bg = AF(str(music_path)).volumex(0.2)
                 final = final.set_audio(bg)
             except:
                 pass
-            # Write final 8-min video
             out_video = self.job_dir / "final_8min.mp4"
             final.write_videofile(str(out_video), fps=24, codec='libx264', audio_codec='aac', threads=2, preset='medium')
-            # Generate shorts
+            # Create shorts
             self.update_status("Creating TikTok shorts...", 90)
             await self.create_shorts(out_video)
             # Thumbnail
             thumb_path = await self.generate_thumbnail()
-            # Metadata
             title, desc = await self.generate_metadata()
             jobs[self.job_id].update({
                 'completed': True,
@@ -630,16 +462,13 @@ class VideoGenerator:
         except Exception as e:
             jobs[self.job_id]['status'] = f"Error: {str(e)}"
             jobs[self.job_id]['error'] = str(e)
-            print(f"Generation error: {e}")
 
     async def create_shorts(self, video_path: Path):
         from moviepy.video.io.VideoFileClip import VideoFileClip
         video = VideoFileClip(str(video_path))
         dur = video.duration
-        # Short 1: first 60sec
         clip1 = video.subclip(0, min(60, dur))
         clip1.write_videofile(str(self.job_dir / "short1.mp4"), fps=24)
-        # Short 2: middle or near end
         start = max(0, (dur - 60) // 2) if dur > 120 else max(0, dur-60)
         clip2 = video.subclip(start, min(start+60, dur))
         clip2.write_videofile(str(self.job_dir / "short2.mp4"), fps=24)
@@ -659,7 +488,6 @@ class VideoGenerator:
         except:
             font = ImageFont.load_default()
             font_small = font
-        # Outline effect
         text = self.theme.upper()
         for dx,dy in [(-3,-3),(-3,3),(3,-3),(3,3)]:
             draw.text((960+dx,400+dy), text, fill=(0,0,0), anchor="mm", font=font)

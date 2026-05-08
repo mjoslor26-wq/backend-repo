@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
 Curiosity Trap – Video Generation Backend
-All fixes applied:
-- Correct moviepy imports (NO broken `.video.compositing.concatenate`)
-- Gemini model fallback (2.5-flash → 2.0-flash → 2.0-flash-lite)
-- Enforced 8‑minute script (900+ words)
-- Polling TTS (Edge TTS runs in background → no timeout)
-- Ken Burns zoom, vignette, word-by-word subtitles
+- Script: Gemini fallback with retry on 503 (overload)
+- TTS: Polling background task with Edge TTS (no timeout)
+- Video: Ken Burns zoom, vignette, word-by-word subtitles
 """
 
-import os, json, io, asyncio, tempfile, logging, uuid
+import os, json, io, asyncio, tempfile, logging, uuid, time
 from typing import List, Dict
 
 import requests
@@ -22,14 +19,13 @@ from google.genai import types as genai_types
 
 import edge_tts
 
-# ---------- CORRECT moviepy imports ----------
 from moviepy import (
     VideoFileClip,
     ImageClip,
     AudioFileClip,
     CompositeVideoClip,
     TextClip,
-    concatenate_videoclips,   # <-- THIS IS THE FIXED IMPORT
+    concatenate_videoclips,
     vfx,
 )
 import numpy as np
@@ -50,20 +46,20 @@ app.add_middleware(
 PEXELS_API_URL = "https://api.pexels.com/v1/search"
 SCRIPT_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
 
-# In‑memory storage for TTS tasks (ok for single‑instance demo)
+# In‑memory storage for TTS tasks
 tts_tasks: Dict[str, Dict] = {}
 
 # ----------------------------------------------------------------------
-# 1. SCRIPT GENERATION (with enforced 8‑minute length)
+# 1. SCRIPT GENERATION (with retry on 503)
 # ----------------------------------------------------------------------
 def generate_script(theme: str, api_key: str) -> dict:
     client = genai.Client(api_key=api_key)
 
-    last_error = None
     for model_name in SCRIPT_MODELS:
-        try:
-            logger.info(f"Trying script model: {model_name}")
-            prompt = f"""
+        logger.info(f"Trying script model: {model_name}")
+        for attempt in range(3):  # up to 3 attempts per model
+            try:
+                prompt = f"""
 You are a script writer for the documentary series "The Curiosity Trap". Write a script for an EXACTLY 8‑minute video (about 900‑1000 words) on the theme: "{theme}".
 
 Structure:
@@ -92,61 +88,60 @@ Output ONLY a valid JSON object with these exact keys:
 The fullText MUST be at least 900 words long.
 Return only valid JSON, no other text.
 """
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
-            )
-            raw = response.text.strip()
-            if raw.startswith("```json"):
-                raw = raw[7:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
-            script = json.loads(raw)
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                    ),
+                )
+                raw = response.text.strip()
+                if raw.startswith("```json"):
+                    raw = raw[7:]
+                if raw.endswith("```"):
+                    raw = raw[:-3]
+                raw = raw.strip()
+                script = json.loads(raw)
 
-            # Ensure fullText exists
-            if "fullText" not in script:
-                full = ""
-                for ch in script.get("chapters", []):
-                    full += f"Chapter: {ch['title']}. {ch['text']} "
-                script["fullText"] = full.strip()
+                # Ensure fullText exists
+                if "fullText" not in script:
+                    full = ""
+                    for ch in script.get("chapters", []):
+                        full += f"Chapter: {ch['title']}. {ch['text']} "
+                    script["fullText"] = full.strip()
 
-            word_count = len(script.get("fullText", "").split())
-            logger.info(f"Script word count: {word_count}")
-            if word_count < 800:
-                logger.warning(f"Script too short ({word_count} words). Trying next model.")
-                continue
+                word_count = len(script.get("fullText", "").split())
+                logger.info(f"Script word count: {word_count}")
+                if word_count < 800:
+                    logger.warning(f"Script too short ({word_count} words). Trying next model.")
+                    break  # move to next model
+                return script
 
-            return script
-
-        except Exception as e:
-            err_str = str(e)
-            logger.warning(f"Model {model_name} failed: {err_str}")
-            if "429" in err_str or "quota" in err_str.lower():
-                last_error = e
-                continue
-            elif "404" in err_str or "not found" in err_str.lower():
-                continue
-            else:
-                raise HTTPException(500, f"Script generation error: {err_str}")
+            except Exception as e:
+                err_str = str(e)
+                logger.warning(f"Model {model_name} attempt {attempt+1} failed: {err_str}")
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    # Temporary overload – wait and retry
+                    if attempt < 2:
+                        logger.info("Waiting 10 seconds before retry...")
+                        time.sleep(10)
+                        continue
+                # For other errors or final attempt, stop retrying this model
+                break
 
     raise HTTPException(
         429,
-        "All Gemini models are currently rate‑limited or no acceptable script produced. Please wait or use a different API key.",
+        "All Gemini models are temporarily unavailable or rate‑limited. Please wait a few minutes and try again.",
     )
 
 # ----------------------------------------------------------------------
-# 2. POLLING TTS (background task → no timeout)
+# 2. TTS WITH POLLING (background task)
 # ----------------------------------------------------------------------
 def _run_tts_generation(task_id: str, text: str):
     """Generate MP3 in background thread using Edge TTS."""
     try:
         communicate = edge_tts.Communicate(text, "en-US-ChristopherNeural")
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            # edge_tts' save() is async, so we run a temporary event loop
             loop = asyncio.new_event_loop()
             loop.run_until_complete(communicate.save(tmp.name))
             loop.close()
@@ -162,11 +157,8 @@ async def api_start_tts(data: dict, background_tasks: BackgroundTasks):
     text = data.get("text")
     if not text:
         raise HTTPException(400, "text is required")
-
     task_id = uuid.uuid4().hex
     tts_tasks[task_id] = {"status": "processing"}
-
-    # Offload the actual generation so the request returns immediately
     background_tasks.add_task(_run_tts_generation, task_id, text)
     return {"task_id": task_id, "status": "processing"}
 
@@ -241,7 +233,6 @@ def apply_vignette(frame, intensity=0.6):
 
 
 def build_video(script_data, audio_bytes, image_urls):
-    # Save audio to temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
         tmp.write(audio_bytes)
         audio_path = tmp.name

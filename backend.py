@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
 Curiosity Trap – Video Generation Backend
-- Script: Gemini (2.5‑flash → 2.0‑flash → 1.5‑flash) with enforced ~8‑minute length
-- TTS: Gemini native TTS → Edge‑TTS (always works)
-- Video: Ken Burns, vignette, word‑by‑word subtitles
+Fixed model list + 8‑minute script enforcement.
 """
 
 import os, json, io, asyncio, tempfile, logging
@@ -26,7 +24,6 @@ from moviepy import (
 import numpy as np
 from PIL import Image
 
-# ----------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("curiosity-backend")
 
@@ -41,15 +38,15 @@ app.add_middleware(
 
 PEXELS_API_URL = "https://api.pexels.com/v1/search"
 
-# Models for scriptwriting (tried in order)
+# Only currently available free-tier models for the new SDK
 SCRIPT_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
+    "gemini-2.0-flash-lite",
 ]
 
 # ----------------------------------------------------------------------
-# 1. SCRIPT GENERATION WITH ENFORCED 8‑MINUTE LENGTH
+# 1. SCRIPT GENERATION WITH FALLBACK & LENGTH GUARANTEE
 # ----------------------------------------------------------------------
 def generate_script(theme: str, api_key: str) -> dict:
     client = genai.Client(api_key=api_key)
@@ -109,11 +106,10 @@ Return only valid JSON, no other text.
                     full += f"Chapter: {ch['title']}. {ch['text']} "
                 script["fullText"] = full.strip()
 
-            # Check word count – enforce 8‑minute length
             word_count = len(script.get("fullText", "").split())
             logger.info(f"Script word count: {word_count}")
             if word_count < 800:
-                logger.warning(f"Script too short ({word_count} words), retrying with different model")
+                logger.warning(f"Script too short ({word_count} words). Trying next model or retry.")
                 continue   # try next model
 
             return script
@@ -124,14 +120,17 @@ Return only valid JSON, no other text.
             if "429" in err_str or "quota" in err_str.lower():
                 last_error = e
                 continue
+            elif "404" in err_str or "not found" in err_str.lower():
+                # Skip invalid model, try next
+                continue
             else:
+                # Non-retryable error – raise immediately
                 raise HTTPException(500, f"Script generation error: {err_str}")
 
     raise HTTPException(
         429,
-        "All Gemini models are currently rate‑limited. Please wait or use a different API key.",
+        "All Gemini models are currently rate‑limited or no acceptable script produced. Please wait or use a different API key.",
     )
-
 
 # ----------------------------------------------------------------------
 # 2. TTS WITH FALLBACK (Gemini → Edge)
@@ -177,7 +176,7 @@ async def generate_tts_with_fallback(text: str, api_key: str) -> bytes:
 
 
 # ----------------------------------------------------------------------
-# 3. HELPERS: keywords, images, video
+# 3. HELPERS
 # ----------------------------------------------------------------------
 def extract_keywords(script_data: dict) -> List[str]:
     keywords = set()
@@ -227,7 +226,6 @@ def apply_vignette(frame, intensity=0.6):
 
 
 def build_video(script_data, audio_bytes, image_urls):
-    # Save audio
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
         tmp.write(audio_bytes)
         audio_path = tmp.name
@@ -235,7 +233,6 @@ def build_video(script_data, audio_bytes, image_urls):
     audio_clip = AudioFileClip(audio_path)
     total_dur = audio_clip.duration
 
-    # Download images
     images = []
     for url in image_urls:
         try:
@@ -246,14 +243,11 @@ def build_video(script_data, audio_bytes, image_urls):
     if not images:
         raise ValueError("No valid images downloaded")
 
-    # Create image clips
     avg_dur = total_dur / len(images)
     clips = []
     for img in images:
         clip = ImageClip(img).with_duration(avg_dur)
-        # Ken Burns zoom
         clip = clip.resized(lambda t: 1.0 + 0.05 * (t / avg_dur) if avg_dur > 0 else 1.0)
-        # Vignette – using .transform() instead of .fl()
         clip = clip.transform(lambda frame: apply_vignette(frame))
         clips.append(clip)
 
@@ -264,7 +258,6 @@ def build_video(script_data, audio_bytes, image_urls):
     video = video.subclip(0, total_dur)
     video = video.with_audio(audio_clip)
 
-    # Write to temporary file (no problematic temp_audiofile argument)
     output_path = tempfile.mktemp(suffix=".mp4")
     video.write_videofile(
         output_path,

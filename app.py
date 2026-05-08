@@ -1,11 +1,11 @@
-# app.py - Complete AI Video Generation System with UI (using gTTS)
-# Deployable on Render.com - includes PIL compatibility fix
+# app.py - with persistent job storage (disk-based)
 
 import os
 import re
 import asyncio
 import aiohttp
 import uuid
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request, Form, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from PIL import Image, ImageDraw, ImageFont
 
-# >>> FIX for Pillow >= 10.0.0: ANTIALIAS removed, replace with LANCZOS
+# Fix for Pillow >= 10.0.0
 if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.LANCZOS
 
@@ -23,7 +23,7 @@ import nltk
 import numpy as np
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips, vfx
 
-# Download NLTK data (will happen on first run)
+# Download NLTK data
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
@@ -36,14 +36,40 @@ OUTPUT_DIR = Path("/tmp/generated_videos")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="Auto Video Generator")
-jobs: Dict[str, dict] = {}
-
-TARGET_DURATION = 480  # 8 minutes
-MAX_SHORT_DURATION = 60
-WORDS_PER_MINUTE = 140
 
 # ----------------------------------------------------------------------
-# HTML Templates (embedded - same as before)
+# Persistent job storage (JSON files)
+# ----------------------------------------------------------------------
+JOBS_DIR = OUTPUT_DIR / "jobs_meta"
+JOBS_DIR.mkdir(exist_ok=True)
+
+def save_job(job_id: str, job_data: dict):
+    """Save job metadata to disk"""
+    job_path = JOBS_DIR / f"{job_id}.json"
+    with open(job_path, 'w') as f:
+        json.dump(job_data, f, indent=2)
+
+def load_job(job_id: str) -> dict | None:
+    """Load job metadata from disk"""
+    job_path = JOBS_DIR / f"{job_id}.json"
+    if not job_path.exists():
+        return None
+    with open(job_path, 'r') as f:
+        return json.load(f)
+
+def update_job(job_id: str, updates: dict):
+    """Update an existing job and persist"""
+    job = load_job(job_id)
+    if job:
+        job.update(updates)
+        save_job(job_id, job)
+
+# Helper to get jobs dict in memory for quick access, but fallback to disk
+def get_job(job_id: str) -> dict | None:
+    return load_job(job_id)
+
+# ----------------------------------------------------------------------
+# HTML Templates (same as before, only one change: "New Video" links to /)
 # ----------------------------------------------------------------------
 
 LANDING_PAGE_HTML = """
@@ -209,6 +235,7 @@ RESULT_PAGE_HTML = """
         .title-box { background: white; padding: 16px; border-radius: 16px; font-weight: bold; margin: 12px 0; }
         .desc-box { background: white; padding: 16px; border-radius: 16px; font-family: monospace; white-space: pre-wrap; font-size: 0.9em; }
         .short-row { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
+        .error-box { background: #fee2e2; border: 1px solid #f87171; border-radius: 16px; padding: 32px; text-align: center; margin: 40px; }
         @media (max-width: 768px) { .video-grid, .short-row { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -217,6 +244,11 @@ RESULT_PAGE_HTML = """
     <div class="header">
         <h1>✨ Video Studio</h1>
         <a href="/" class="new-btn">+ New Video</a>
+    </div>
+    <div id="errorBox" class="error-box" style="display: none;">
+        <h2>❌ Job Not Found</h2>
+        <p>The video generation job you're looking for doesn't exist or has expired.</p>
+        <a href="/" style="background: #3b82f6; color: white; padding: 10px 20px; border-radius: 40px; text-decoration: none; display: inline-block; margin-top: 16px;">Create New Video</a>
     </div>
     <div id="progressSection" class="progress-section">
         <h2>🔄 Generating your content...</h2>
@@ -259,6 +291,12 @@ RESULT_PAGE_HTML = """
     async function checkStatus() {
         try {
             const res = await fetch(`/status/${jobId}`);
+            if (res.status === 404) {
+                clearInterval(interval);
+                document.getElementById('progressSection').style.display = 'none';
+                document.getElementById('errorBox').style.display = 'block';
+                return;
+            }
             const data = await res.json();
             document.getElementById('progressFill').style.width = data.progress + '%';
             document.getElementById('progressFill').innerText = data.progress + '%';
@@ -284,8 +322,10 @@ RESULT_PAGE_HTML = """
         videos[2].load();
         document.getElementById('thumbnailImg').src = `/download/${jobId}/thumbnail`;
         fetch(`/status/${jobId}`).then(r=>r.json()).then(data=>{
-            document.getElementById('titleDisplay').innerText = data.title || 'Your Video Title';
-            document.getElementById('descDisplay').innerText = data.description || 'Description will appear here.';
+            if (!data.error) {
+                document.getElementById('titleDisplay').innerText = data.title || 'Your Video Title';
+                document.getElementById('descDisplay').innerText = data.description || 'Description will appear here.';
+            }
         });
     }
     function downloadFile(type) { window.location.href = `/download/${jobId}/${type}`; }
@@ -300,7 +340,7 @@ RESULT_PAGE_HTML = """
 """
 
 # ----------------------------------------------------------------------
-# Video Generation Engine (using gTTS)
+# Video Generation Engine (same as before, but uses save_job/update_job)
 # ----------------------------------------------------------------------
 
 class VideoGenerator:
@@ -315,8 +355,7 @@ class VideoGenerator:
         self.images_dir.mkdir(exist_ok=True)
 
     def update_status(self, message: str, progress: int):
-        jobs[self.job_id]['status'] = message
-        jobs[self.job_id]['progress'] = progress
+        update_job(self.job_id, {'status': message, 'progress': progress})
 
     async def fetch_wikipedia_content(self) -> str:
         self.update_status("Researching topic...", 5)
@@ -332,7 +371,6 @@ class VideoGenerator:
             return f"{self.theme} is an incredible topic. From basics to advanced concepts, this 8-minute guide will take you on a journey of discovery."
 
     async def generate_tts(self, text: str, output_path: Path) -> float:
-        """Generate speech using gTTS (Google Text-to-Speech)"""
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._synth_gtts, text, output_path)
         audio = AudioFileClip(str(output_path))
@@ -384,7 +422,6 @@ class VideoGenerator:
         audio = AudioFileClip(str(audio_path))
         duration = audio.duration
         clip = ImageClip(str(image_path)).resize(height=1080).set_duration(duration)
-        # Ken Burns effect
         def make_frame(t):
             zoom = 1 + (t / duration) * 0.08
             new_w = clip.w / zoom
@@ -399,7 +436,6 @@ class VideoGenerator:
         try:
             content = await self.fetch_wikipedia_content()
             sentences = re.split(r'(?<=[.!?])\s+', content)
-            # Build segments of ~15-20 sec each (~100 words)
             segments = []
             current = []
             word_count = 0
@@ -417,7 +453,6 @@ class VideoGenerator:
                 segments.append(' '.join(current))
             while len(segments) < 20:
                 segments.append(f"Let's continue exploring {self.theme}. Amazing insights await.")
-            # Generate clips
             video_clips = []
             total_segs = len(segments)
             for i, seg_text in enumerate(segments[:35]):
@@ -429,10 +464,8 @@ class VideoGenerator:
                 img_path = await self.fetch_image(kw, i)
                 clip = await self.create_video_clip(img_path, audio_path)
                 video_clips.append(clip)
-            # Concatenate
             self.update_status("Editing video with transitions...", 85)
             final = concatenate_videoclips(video_clips, method="compose")
-            # Add simple background music (optional)
             try:
                 duration = final.duration
                 fps = 44100
@@ -449,13 +482,11 @@ class VideoGenerator:
                 pass
             out_video = self.job_dir / "final_8min.mp4"
             final.write_videofile(str(out_video), fps=24, codec='libx264', audio_codec='aac', threads=2, preset='medium')
-            # Create shorts
             self.update_status("Creating TikTok shorts...", 90)
             await self.create_shorts(out_video)
-            # Thumbnail
             thumb_path = await self.generate_thumbnail()
             title, desc = await self.generate_metadata()
-            jobs[self.job_id].update({
+            update_job(self.job_id, {
                 'completed': True,
                 'video_path': str(out_video),
                 'short1_path': str(self.job_dir / "short1.mp4"),
@@ -466,8 +497,7 @@ class VideoGenerator:
             })
             self.update_status("Complete! Ready to download.", 100)
         except Exception as e:
-            jobs[self.job_id]['status'] = f"Error: {str(e)}"
-            jobs[self.job_id]['error'] = str(e)
+            update_job(self.job_id, {'status': f"Error: {str(e)}", 'error': str(e)})
 
     async def create_shorts(self, video_path: Path):
         from moviepy.video.io.VideoFileClip import VideoFileClip
@@ -529,7 +559,7 @@ Discover everything about {self.theme} in this engaging 8-minute video.
         return title, desc
 
 # ----------------------------------------------------------------------
-# FastAPI Routes
+# FastAPI Routes (modified to use disk-based storage)
 # ----------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
@@ -539,35 +569,36 @@ async def landing():
 @app.post("/generate")
 async def start_gen(theme: str = Form(...), background_tasks: BackgroundTasks = BackgroundTasks()):
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {
+    job_data = {
         'status': 'Initializing...',
         'progress': 0,
         'completed': False,
         'theme': theme,
         'created_at': datetime.now().isoformat()
     }
+    save_job(job_id, job_data)
     generator = VideoGenerator(theme, job_id)
     background_tasks.add_task(generator.generate)
     return JSONResponse({'job_id': job_id})
 
 @app.get("/status/{job_id}")
 async def status(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(404)
-    return JSONResponse(jobs[job_id])
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, detail="Job not found")
+    return JSONResponse(job)
 
 @app.get("/result/{job_id}", response_class=HTMLResponse)
 async def result_page(job_id: str):
-    if job_id not in jobs:
-        return HTMLResponse("Job not found", status_code=404)
+    # We'll just serve the HTML; the frontend will handle missing jobs
     html = RESULT_PAGE_HTML.replace("{{ job_id }}", job_id)
     return HTMLResponse(content=html)
 
 @app.get("/download/{job_id}/{file_type}")
 async def download(job_id: str, file_type: str):
-    if job_id not in jobs:
-        raise HTTPException(404)
-    job = jobs[job_id]
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, detail="Job not found")
     if not job.get('completed'):
         raise HTTPException(400, detail="Video not ready")
     mapping = {
@@ -589,7 +620,7 @@ if __name__ == "__main__":
     print("""
     ╔══════════════════════════════════════════════════════════╗
     ║   🎬 AI Video Generator - Fully Self-Contained          ║
-    ║   UI + Backend in one file                              ║
+    ║   Persistent jobs (disk) + better error handling       ║
     ║   ▶  Running on http://localhost:8000                   ║
     ╚══════════════════════════════════════════════════════════╝
     """)

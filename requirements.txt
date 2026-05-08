@@ -7,3 +7,4 @@ requests
 Pillow
 numpy
 opencv-python
+python-multipart

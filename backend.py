@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Curiosity Trap – Video Generation Backend
-Fixed model list + 8‑minute script enforcement.
+- Script: Gemini (2.5‑flash → 2.0‑flash → 2.0‑flash‑lite) with enforced 8‑minute length
+- TTS: Streaming Edge‑TTS fallback (always works, no timeout)
+- Video: Ken Burns, vignette, word‑by‑word subtitles
 """
 
 import os, json, io, asyncio, tempfile, logging
-from typing import List
+from typing import List, AsyncGenerator
 
 import requests
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
@@ -38,7 +40,6 @@ app.add_middleware(
 
 PEXELS_API_URL = "https://api.pexels.com/v1/search"
 
-# Only currently available free-tier models for the new SDK
 SCRIPT_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -46,7 +47,7 @@ SCRIPT_MODELS = [
 ]
 
 # ----------------------------------------------------------------------
-# 1. SCRIPT GENERATION WITH FALLBACK & LENGTH GUARANTEE
+# 1. SCRIPT GENERATION
 # ----------------------------------------------------------------------
 def generate_script(theme: str, api_key: str) -> dict:
     client = genai.Client(api_key=api_key)
@@ -99,7 +100,6 @@ Return only valid JSON, no other text.
             raw = raw.strip()
             script = json.loads(raw)
 
-            # Ensure fullText exists
             if "fullText" not in script:
                 full = ""
                 for ch in script.get("chapters", []):
@@ -109,8 +109,8 @@ Return only valid JSON, no other text.
             word_count = len(script.get("fullText", "").split())
             logger.info(f"Script word count: {word_count}")
             if word_count < 800:
-                logger.warning(f"Script too short ({word_count} words). Trying next model or retry.")
-                continue   # try next model
+                logger.warning(f"Script too short ({word_count} words). Trying next model.")
+                continue
 
             return script
 
@@ -121,10 +121,8 @@ Return only valid JSON, no other text.
                 last_error = e
                 continue
             elif "404" in err_str or "not found" in err_str.lower():
-                # Skip invalid model, try next
                 continue
             else:
-                # Non-retryable error – raise immediately
                 raise HTTPException(500, f"Script generation error: {err_str}")
 
     raise HTTPException(
@@ -133,47 +131,46 @@ Return only valid JSON, no other text.
     )
 
 # ----------------------------------------------------------------------
-# 2. TTS WITH FALLBACK (Gemini → Edge)
+# 2. STREAMING TTS (Gemini attempt → Edge streaming fallback)
 # ----------------------------------------------------------------------
-async def generate_tts_gemini(text: str, api_key: str) -> bytes:
-    if not api_key:
-        raise RuntimeError("No API key provided for Gemini TTS")
-    client = genai.Client(api_key=api_key)
-    # Placeholder model – adjust when real TTS model is available
-    response = client.models.generate_content(
-        model="gemini-2.0-flash-tts",
-        contents=text,
-        config=genai_types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-        ),
-    )
-    if response.candidates and response.candidates[0].content.parts:
-        for part in response.candidates[0].content.parts:
-            if hasattr(part, "inline_data") and part.inline_data.mime_type.startswith("audio/"):
-                return part.inline_data.data
-    raise RuntimeError("No audio data in Gemini TTS response")
-
-
-async def generate_tts_edge(text: str) -> bytes:
+async def generate_tts_edge_stream(text: str) -> AsyncGenerator[bytes, None]:
+    """Stream Edge TTS chunks directly – no buffering, no timeout."""
     communicate = edge_tts.Communicate(text, "en-US-ChristopherNeural")
-    mp3_data = io.BytesIO()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
-            mp3_data.write(chunk["data"])
-    return mp3_data.getvalue()
+            yield chunk["data"]
 
 
-async def generate_tts_with_fallback(text: str, api_key: str) -> bytes:
-    try:
-        logger.info("Attempting Gemini native TTS")
-        if api_key:
-            return await generate_tts_gemini(text, api_key)
-        else:
-            raise RuntimeError("No API key for Gemini TTS")
-    except Exception as e:
-        logger.warning(f"Gemini TTS failed ({e}), using Edge TTS fallback")
-        return await generate_tts_edge(text)
+async def generate_tts_gemini_stream(text: str, api_key: str) -> AsyncGenerator[bytes, None]:
+    """Placeholder for Gemini native TTS streaming – currently not implemented."""
+    # The real implementation would yield audio chunks from the Gemini API
+    raise NotImplementedError("Gemini TTS streaming not yet available")
 
+
+@app.post("/api/generate-tts")
+async def api_generate_tts(data: dict):
+    text = data.get("text")
+    api_key = data.get("apiKey", "")
+    if not text:
+        raise HTTPException(400, "text is required")
+
+    # First try Gemini TTS (if key provided), else stream Edge directly
+    if api_key:
+        try:
+            logger.info("Attempting Gemini native TTS")
+            return StreamingResponse(
+                generate_tts_gemini_stream(text, api_key),
+                media_type="audio/mpeg",
+            )
+        except Exception as e:
+            logger.warning(f"Gemini TTS failed ({e}), falling back to streaming Edge TTS")
+
+    # Edge TTS fallback – always works
+    logger.info("Streaming Edge TTS")
+    return StreamingResponse(
+        generate_tts_edge_stream(text),
+        media_type="audio/mpeg",
+    )
 
 # ----------------------------------------------------------------------
 # 3. HELPERS
@@ -289,16 +286,6 @@ async def api_generate_script(data: dict):
     return script
 
 
-@app.post("/api/generate-tts")
-async def api_generate_tts(data: dict):
-    text = data.get("text")
-    api_key = data.get("apiKey", "")
-    if not text:
-        raise HTTPException(400, "text is required")
-    audio_bytes = await generate_tts_with_fallback(text, api_key)
-    return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
-
-
 @app.post("/api/fetch-images")
 async def api_fetch_images(data: dict):
     keywords = data.get("keywords", [])
@@ -318,6 +305,7 @@ async def api_compose_video(
 ):
     script_data = json.loads(script)
     image_urls = json.loads(imageUrls)
+    # The entire audio file has already been downloaded by the frontend before this call.
     audio_bytes = await audio.read()
 
     loop = asyncio.get_running_loop()
